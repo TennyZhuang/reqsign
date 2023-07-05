@@ -384,9 +384,7 @@ impl Loader {
 
 /// Load credential from environment variables.
 #[derive(Default)]
-struct EnvLoader {
-    credential: Arc<Mutex<Option<Credential>>>,
-}
+struct EnvLoader {}
 
 impl Debug for EnvLoader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -397,11 +395,6 @@ impl Debug for EnvLoader {
 #[async_trait]
 impl CredentialLoad for EnvLoader {
     async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
-        match self.credential.lock().expect("lock poisoned").clone() {
-            Some(cred) if cred.is_valid() => return Ok(Some(cred)),
-            _ => (),
-        }
-
         let envs = env::vars().collect::<HashMap<_, _>>();
 
         let access_key_id = match envs.get(AWS_ACCESS_KEY_ID) {
@@ -431,9 +424,6 @@ impl CredentialLoad for EnvLoader {
             session_token: token,
             expires_in,
         };
-
-        let mut lock = self.credential.lock().expect("lock poisoned");
-        *lock = Some(cred.clone());
 
         Ok(Some(cred))
     }
