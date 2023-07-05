@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::env;
+use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Write;
 use std::fs;
@@ -14,6 +17,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use super::config::Config;
+use crate::aws::constants::*;
 use crate::time::now;
 use crate::time::parse_rfc3339;
 use crate::time::DateTime;
@@ -378,6 +382,63 @@ impl Loader {
     }
 }
 
+/// Load credential from environment variables.
+#[derive(Default)]
+struct EnvLoader {
+    credential: Arc<Mutex<Option<Credential>>>,
+}
+
+impl Debug for EnvLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvLoader").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for EnvLoader {
+    async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
+        match self.credential.lock().expect("lock poisoned").clone() {
+            Some(cred) if cred.is_valid() => return Ok(Some(cred)),
+            _ => (),
+        }
+
+        let envs = env::vars().collect::<HashMap<_, _>>();
+
+        let access_key_id = match envs.get(AWS_ACCESS_KEY_ID) {
+            Some(v) => v.to_string(),
+            None => return Ok(None),
+        };
+        let secret_access_key = match envs.get(AWS_SECRET_ACCESS_KEY) {
+            Some(v) => v.to_string(),
+            None => return Ok(None),
+        };
+
+        // Allow both AWS_SESSION_TOKEN and AWS_SECURITY_TOKEN.
+        let token = envs
+            .get(AWS_SESSION_TOKEN)
+            .or(envs.get(AWS_SECURITY_TOKEN))
+            .cloned();
+
+        // Set expires_in to 1 hour to enforce re-read from env.
+        let expires_in = match envs.get(AWS_CREDENTIAL_EXPIRATION) {
+            Some(v) => Some(parse_rfc3339(v)?),
+            None => Some(now() + chrono::Duration::hours(1)),
+        };
+
+        let cred = Credential {
+            access_key_id,
+            secret_access_key,
+            session_token: token,
+            expires_in,
+        };
+
+        let mut lock = self.credential.lock().expect("lock poisoned");
+        *lock = Some(cred.clone());
+
+        Ok(Some(cred))
+    }
+}
+
 #[derive(Default, Debug, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 struct AssumeRoleWithWebIdentityResponse {
@@ -446,7 +507,6 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::aws::constants::*;
     use crate::aws::v4::Signer;
 
     static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
