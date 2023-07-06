@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use anyhow::anyhow;
@@ -542,6 +543,126 @@ impl CredentialLoad for ConfigProfileLoader {
         } else {
             Ok(None)
         }
+    }
+}
+
+/// Load credential via EC2 instance metadata.
+struct Ec2InstanceMetadataLoader {
+    /// Token and it's expire time.
+    token: Arc<Mutex<(String, DateTime)>>,
+}
+
+impl Debug for Ec2InstanceMetadataLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ec2InstanceMetadataLoader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Ec2InstanceMetadataLoader {
+    fn default() -> Self {
+        Self {
+            token: Arc::new(Mutex::new((String::default(), DateTime::MIN_UTC))),
+        }
+    }
+}
+
+impl Ec2InstanceMetadataLoader {
+    /// TODO: we should support customed metadata endpoint.
+    async fn get_ec2_metadata_token(&self, client: Client) -> Result<String> {
+        {
+            let (token, expires_in) = self.token.lock().unwrap().clone();
+            if !token.is_empty() && expires_in > now() {
+                return Ok(token);
+            }
+        }
+
+        // Get ec2 metadata token
+        let url = "http://169.254.169.254/latest/api/token";
+        let req = client
+            .put(url)
+            .timeout(Duration::from_secs(1))
+            .header(CONTENT_LENGTH, "0")
+            .header("x-aws-ec2-metadata-token-ttl-seconds", "21600");
+        let resp = req.send().await?;
+        if resp.status() != http::StatusCode::OK {
+            let content = resp.text().await?;
+            return Err(anyhow!(
+                "request to AWS EC2 Metadata Services failed: {content}"
+            ));
+        }
+        let token = resp.text().await?;
+
+        // 21600s is the default value from AWS CLI.
+        // We will minus 120s to avoid time skew.
+        //
+        // We will allow user to configure it in the future.
+        let expires_in = now() + chrono::Duration::seconds(21600 - 120);
+
+        *self.token.lock().unwrap() = (token.clone(), expires_in);
+        Ok(token)
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for Ec2InstanceMetadataLoader {
+    async fn load_credential(&self, client: Client) -> Result<Option<Credential>> {
+        // If AWS_EC2_METADATA_DISABLED has been set to true, we should
+        // ignore this loader directly.
+        if let Ok(v) = env::var(AWS_EC2_METADATA_DISABLED) {
+            if v == "true" {
+                return Ok(None);
+            }
+        }
+
+        let token = self.get_ec2_metadata_token(client.clone()).await?;
+
+        // List all credentials that node has.
+        let url = "http://169.254.169.254/latest/meta-data/iam/security-credentials/";
+        let req = client
+            .get(url)
+            .timeout(Duration::from_secs(1))
+            .header("x-aws-ec2-metadata-token", &token);
+        let resp = req.send().await?;
+        if resp.status() != http::StatusCode::OK {
+            let content = resp.text().await?;
+            return Err(anyhow!(
+                "request to AWS EC2 Metadata Services failed: {content}"
+            ));
+        }
+        let role_name = resp.text().await?;
+
+        // Get the credentials via role_name.
+        let url =
+            format!("http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}");
+        let req = client
+            .get(&url)
+            .timeout(Duration::from_secs(1))
+            .header("x-aws-ec2-metadata-token", &token);
+        let resp = req.send().await?;
+        if resp.status() != http::StatusCode::OK {
+            let content = resp.text().await?;
+            return Err(anyhow!(
+                "request to AWS EC2 Metadata Services failed: {content}"
+            ));
+        }
+
+        let content = resp.text().await?;
+        let resp: Ec2MetadataIamSecurityCredentials = serde_json::from_str(&content)?;
+        if resp.code != "Success" {
+            return Err(anyhow!(
+                "request to AWS EC2 Metadata Services failed: {content}"
+            ));
+        }
+
+        let cred = Credential {
+            access_key_id: resp.access_key_id,
+            secret_access_key: resp.secret_access_key,
+            session_token: Some(resp.token),
+            expires_in: Some(parse_rfc3339(&resp.expiration)?),
+        };
+
+        Ok(Some(cred))
     }
 }
 
