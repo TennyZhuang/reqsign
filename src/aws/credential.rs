@@ -447,6 +447,7 @@ impl Debug for CredentialProfileLoader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CredentialProfileLoader")
             .field("path", &self.path)
+            .field("profile_name", &self.profile_name)
             .finish_non_exhaustive()
     }
 }
@@ -473,8 +474,8 @@ impl CredentialProfileLoader {
         let profile = if self.last_updated.load(Ordering::Relaxed) >= last_modified as i64 {
             self.profiles.lock().unwrap().get(name)
         } else {
-            let ccontent = tokio::fs::read_to_string(&self.path).await?;
-            let profiles = CredentialProfiles::new(&ccontent)?;
+            let content = tokio::fs::read_to_string(&self.path).await?;
+            let profiles = CredentialProfiles::new(&content)?;
 
             // Update last_updated so that we don't need to read again.
             self.last_updated
@@ -491,6 +492,86 @@ impl CredentialProfileLoader {
 
 #[async_trait]
 impl CredentialLoad for CredentialProfileLoader {
+    async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
+        let profile = self.get_profile(&self.profile_name).await?;
+
+        if let (Some(access_key_id), Some(secret_access_key)) =
+            (&profile.aws_access_key_id, &profile.aws_secret_access_key)
+        {
+            let cred = Credential {
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                session_token: profile.aws_session_token.clone(),
+                // Enforce re-read from file after 1 hour.
+                expires_in: Some(now() + chrono::Duration::hours(1)),
+            };
+
+            Ok(Some(cred))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Load credential from config variables.
+struct ConfigProfileLoader {
+    path: String,
+    profile_name: String,
+
+    /// The timestampe for last updated time of profiles.
+    last_updated: AtomicI64,
+    profiles: Arc<Mutex<ConfigProfiles>>,
+}
+
+impl Debug for ConfigProfileLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigProfileLoader")
+            .field("path", &self.path)
+            .field("profile_name", &self.profile_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ConfigProfileLoader {
+    fn default() -> Self {
+        Self {
+            path: "~/.aws/config".to_string(),
+            profile_name: "default".to_string(),
+            last_updated: AtomicI64::default(),
+            profiles: Arc::default(),
+        }
+    }
+}
+
+impl ConfigProfileLoader {
+    /// Get credential profile via this loader.
+    pub async fn get_profile(&self, name: &str) -> Result<Arc<ConfigProfile>> {
+        let meta = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|err| anyhow!("get metadata of config file failed: {err}"))?;
+        let last_modified = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+
+        let profile = if self.last_updated.load(Ordering::Relaxed) >= last_modified as i64 {
+            self.profiles.lock().unwrap().get(name)
+        } else {
+            let content = tokio::fs::read_to_string(&self.path).await?;
+            let profiles = ConfigProfiles::new(&content)?;
+
+            // Update last_updated so that we don't need to read again.
+            self.last_updated
+                .store(now().timestamp(), Ordering::Relaxed);
+            let profile = profiles.get(name);
+
+            *self.profiles.lock().unwrap() = profiles;
+            profile
+        };
+
+        Ok(profile)
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for ConfigProfileLoader {
     async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
         let profile = self.get_profile(&self.profile_name).await?;
 
