@@ -133,6 +133,17 @@ pub struct ConfigProfile {
     ///
     /// The AWS CLI loads the contents of this file and passes it as the WebIdentityToken argument to the AssumeRoleWithWebIdentity operation.
     pub web_identity_token_file: Option<String>,
+    /// By default, AWS Security Token Service (AWS STS) is available as a
+    /// global service, and all AWS STS requests go to a single endpoint at
+    /// <https://sts.amazonaws.com>.
+    ///
+    /// This setting specifies how the SDK or tool determines the AWS service endpoint that it uses to talk to the AWS Security Token Service (AWS STS).
+    ///
+    /// Default value: `legacy`
+    /// Valid values:
+    ///   - `legacy`
+    ///   - `regional`
+    pub sts_regional_endpoints: Option<String>,
 }
 
 impl ConfigProfiles {
@@ -212,6 +223,9 @@ impl ConfigProfiles {
             }
             if let Some(v) = props.get("web_identity_token_file") {
                 profile.web_identity_token_file = Some(v.to_string())
+            }
+            if let Some(v) = props.get("sts_regional_endpoints") {
+                profile.sts_regional_endpoints = Some(v.to_string())
             }
 
             // Config file's section has `profile` prefix.

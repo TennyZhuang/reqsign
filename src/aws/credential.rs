@@ -3,7 +3,6 @@ use std::env;
 use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Write;
-use std::fs;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,6 +14,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use http::header::CONTENT_LENGTH;
 use log::debug;
+use log::warn;
 use quick_xml::de;
 use reqwest::Client;
 use serde::Deserialize;
@@ -146,16 +146,6 @@ impl Loader {
         if let Ok(Some(cred)) = self
             .load_via_config()
             .map_err(|err| debug!("load credential via config failed: {err:?}"))
-        {
-            return Ok(Some(cred));
-        }
-
-        if let Ok(Some(cred)) = self
-            .load_via_assume_role_with_web_identity()
-            .await
-            .map_err(|err| {
-                debug!("load credential via assume_role_with_web_identity failed: {err:?}")
-            })
         {
             return Ok(Some(cred));
         }
@@ -303,44 +293,6 @@ impl Loader {
         }
 
         let resp: AssumeRoleResponse = de::from_str(&resp.text().await?)?;
-        let resp_cred = resp.result.credentials;
-
-        let cred = Credential {
-            access_key_id: resp_cred.access_key_id,
-            secret_access_key: resp_cred.secret_access_key,
-            session_token: Some(resp_cred.session_token),
-            expires_in: Some(parse_rfc3339(&resp_cred.expiration)?),
-        };
-
-        Ok(Some(cred))
-    }
-
-    async fn load_via_assume_role_with_web_identity(&self) -> Result<Option<Credential>> {
-        let (token_file, role_arn) =
-            match (&self.config.web_identity_token_file, &self.config.role_arn) {
-                (Some(token_file), Some(role_arn)) => (token_file, role_arn),
-                _ => return Ok(None),
-            };
-
-        let token = fs::read_to_string(token_file)?;
-        let role_session_name = &self.config.role_session_name;
-
-        let endpoint = self.sts_endpoint()?;
-
-        // Construct request to AWS STS Service.
-        let url = format!("https://{endpoint}/?Action=AssumeRoleWithWebIdentity&RoleArn={role_arn}&WebIdentityToken={token}&Version=2011-06-15&RoleSessionName={role_session_name}");
-        let req = self.client.get(&url).header(
-            http::header::CONTENT_TYPE.as_str(),
-            "application/x-www-form-urlencoded",
-        );
-
-        let resp = req.send().await?;
-        if resp.status() != http::StatusCode::OK {
-            let content = resp.text().await?;
-            return Err(anyhow!("request to AWS STS Services failed: {content}"));
-        }
-
-        let resp: AssumeRoleWithWebIdentityResponse = de::from_str(&resp.text().await?)?;
         let resp_cred = resp.result.credentials;
 
         let cred = Credential {
@@ -593,6 +545,188 @@ impl CredentialLoad for ConfigProfileLoader {
     }
 }
 
+/// Load credential via assume role with web identity.
+struct AssumeRoleWithWebIdentityLoader {
+    profile_name: String,
+    profile_loader: ConfigProfileLoader,
+}
+
+impl Debug for AssumeRoleWithWebIdentityLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssumeRoleWithWebIdentityLoader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AssumeRoleWithWebIdentityLoader {
+    fn default() -> Self {
+        Self {
+            profile_name: "default".to_string(),
+            profile_loader: ConfigProfileLoader::default(),
+        }
+    }
+}
+
+impl AssumeRoleWithWebIdentityLoader {
+    async fn get_web_identity_token_file(&self) -> Option<String> {
+        if let Ok(v) = env::var(AWS_WEB_IDENTITY_TOKEN_FILE) {
+            return Some(v);
+        }
+
+        let profile = self
+            .profile_loader
+            .get_profile(&self.profile_name)
+            .await
+            .ok()?;
+
+        profile.web_identity_token_file.clone()
+    }
+
+    async fn get_role_arn(&self) -> Option<String> {
+        if let Ok(v) = env::var(AWS_ROLE_ARN) {
+            return Some(v);
+        }
+
+        let profile = self
+            .profile_loader
+            .get_profile(&self.profile_name)
+            .await
+            .ok()?;
+
+        profile.role_arn.clone()
+    }
+
+    async fn get_role_session_name(&self) -> Option<String> {
+        if let Ok(v) = env::var(AWS_ROLE_SESSION_NAME) {
+            return Some(v);
+        }
+
+        let profile = self
+            .profile_loader
+            .get_profile(&self.profile_name)
+            .await
+            .ok()?;
+
+        profile.role_session_name.clone()
+    }
+
+    async fn get_sts_regional_endpoints(&self) -> Option<String> {
+        if let Ok(v) = env::var(AWS_STS_REGIONAL_ENDPOINTS) {
+            return Some(v);
+        }
+
+        let profile = self
+            .profile_loader
+            .get_profile(&self.profile_name)
+            .await
+            .ok()?;
+
+        profile.sts_regional_endpoints.clone()
+    }
+
+    async fn get_region(&self) -> Option<String> {
+        if let Ok(v) = env::var(AWS_REGION) {
+            return Some(v);
+        }
+
+        let profile = self
+            .profile_loader
+            .get_profile(&self.profile_name)
+            .await
+            .ok()?;
+
+        profile.region.clone()
+    }
+
+    /// Get the sts endpoint.
+    ///
+    /// The returning format may look like `sts.{region}.amazonaws.com`
+    ///
+    /// # Notes
+    ///
+    /// AWS could have different sts endpoint based on it's region.
+    /// We can check them by region name.
+    ///
+    /// ref: https://github.com/awslabs/aws-sdk-rust/blob/31cfae2cf23be0c68a47357070dea1aee9227e3a/sdk/sts/src/aws_endpoint.rs
+    async fn get_sts_endpoint(&self) -> Result<String> {
+        let sts_regional_endpoints = self
+            .get_sts_regional_endpoints()
+            .await
+            .unwrap_or_else(|| "legacy".to_string());
+
+        // use regional sts if sts_regional_endpoints has been set.
+        if sts_regional_endpoints == "regional" {
+            let region = self.get_region().await.ok_or_else(|| {
+                anyhow!("sts_regional_endpoints set to reginal, but region is not set")
+            })?;
+            if region.starts_with("cn-") {
+                Ok(format!("sts.{region}.amazonaws.com.cn"))
+            } else {
+                Ok(format!("sts.{region}.amazonaws.com"))
+            }
+        } else {
+            let region = self.get_region().await.unwrap_or_default();
+            if region.starts_with("cn") {
+                // TODO: seems aws china doesn't support global sts?
+                Ok("sts.amazonaws.com.cn".to_string())
+            } else {
+                Ok("sts.amazonaws.com".to_string())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for AssumeRoleWithWebIdentityLoader {
+    async fn load_credential(&self, client: Client) -> Result<Option<Credential>> {
+        let token_file = match self.get_web_identity_token_file().await {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let role_arn = match self.get_role_arn().await {
+            Some(v) => v,
+            None => {
+                warn!("Current environment is configured to assume role with web identity but has no role ARN configured");
+                return Ok(None);
+            }
+        };
+
+        let role_session_name = self
+            .get_role_session_name()
+            .await
+            .unwrap_or_else(|| "reqsign".to_string());
+
+        let token = tokio::fs::read_to_string(token_file).await?;
+        let endpoint = self.get_sts_endpoint().await?;
+
+        // Construct request to AWS STS Service.
+        let url = format!("https://{endpoint}/?Action=AssumeRoleWithWebIdentity&RoleArn={role_arn}&WebIdentityToken={token}&Version=2011-06-15&RoleSessionName={role_session_name}");
+        let req = client.get(&url).header(
+            http::header::CONTENT_TYPE.as_str(),
+            "application/x-www-form-urlencoded",
+        );
+
+        let resp = req.send().await?;
+        if resp.status() != http::StatusCode::OK {
+            let content = resp.text().await?;
+            return Err(anyhow!("request to AWS STS Services failed: {content}"));
+        }
+
+        let resp: AssumeRoleWithWebIdentityResponse = de::from_str(&resp.text().await?)?;
+        let resp_cred = resp.result.credentials;
+
+        let cred = Credential {
+            access_key_id: resp_cred.access_key_id,
+            secret_access_key: resp_cred.secret_access_key,
+            session_token: Some(resp_cred.session_token),
+            expires_in: Some(parse_rfc3339(&resp_cred.expiration)?),
+        };
+
+        Ok(Some(cred))
+    }
+}
+
 #[derive(Default, Debug, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 struct AssumeRoleWithWebIdentityResponse {
@@ -662,6 +796,7 @@ mod tests {
 
     use super::*;
     use crate::aws::v4::Signer;
+    use std::fs;
 
     static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         tokio::runtime::Builder::new_multi_thread()
