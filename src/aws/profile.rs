@@ -1,18 +1,20 @@
 use anyhow::Result;
 use ini::Ini;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 /// ConfigProfiles carries all content from `~/.aws/config`.
 #[derive(Default, Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ConfigProfiles {
-    map: HashMap<String, ConfigProfile>,
+    map: HashMap<String, Arc<ConfigProfile>>,
 }
 
 /// ConfigProfile carries all content from a profile in `~/.aws/config`.
 ///
 /// Please note that not all fields are stored yet. We removed all awscli
 /// related fields and s3 related fields.
+///
+/// All fields are listed in: <https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html>
 #[derive(Default, Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct ConfigProfile {
@@ -219,7 +221,7 @@ impl ConfigProfiles {
                 .unwrap_or(section)
                 .trim()
                 .to_string();
-            map.insert(section, profile);
+            map.insert(section, Arc::new(profile));
         }
 
         Ok(ConfigProfiles { map })
@@ -228,7 +230,7 @@ impl ConfigProfiles {
     /// Get profile with given profile name.
     ///
     /// Return default value if not exist.
-    pub fn get(&self, profile: &str) -> ConfigProfile {
+    pub fn get(&self, profile: &str) -> Arc<ConfigProfile> {
         self.map.get(profile).cloned().unwrap_or_default()
     }
 }
@@ -237,7 +239,7 @@ impl ConfigProfiles {
 #[derive(Default, Clone)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct CredentialProfiles {
-    map: HashMap<String, CredentialProfile>,
+    map: HashMap<String, Arc<CredentialProfile>>,
 }
 
 /// CredentialProfile carries all content from a profile in `~/.aws/credentials`.
@@ -284,7 +286,7 @@ impl CredentialProfiles {
             }
 
             // Credentials file's section does't have `profile` prefix.
-            map.insert(section.to_string(), profile);
+            map.insert(section.to_string(), Arc::new(profile));
         }
 
         Ok(CredentialProfiles { map })
@@ -293,7 +295,7 @@ impl CredentialProfiles {
     /// Get profile with given profile name.
     ///
     /// Return default value if not exist.
-    pub fn get(&self, profile: &str) -> CredentialProfile {
+    pub fn get(&self, profile: &str) -> Arc<CredentialProfile> {
         self.map.get(profile).cloned().unwrap_or_default()
     }
 }
@@ -336,6 +338,7 @@ output = json
                 region: Some("us-west-2".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         assert_eq!(
@@ -348,6 +351,7 @@ output = json
                 region: Some("us-east-1".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         Ok(())
@@ -373,6 +377,7 @@ output=text
                 region: Some("us-west-2".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         assert_eq!(
@@ -381,6 +386,7 @@ output=text
                 region: Some("us-east-1".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         Ok(())
@@ -409,6 +415,7 @@ output=text
                 region: Some("us-west-2".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         assert_eq!(
@@ -420,6 +427,7 @@ output=text
                 region: Some("us-east-1".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         Ok(())
@@ -451,6 +459,7 @@ output=text
                 region: Some("us-west-2".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         assert_eq!(
@@ -461,6 +470,7 @@ output=text
                 region: Some("us-east-1".to_string()),
                 ..Default::default()
             }
+            .into()
         );
 
         Ok(())
@@ -488,7 +498,7 @@ aws_session_token = fcZib3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJ
                 aws_access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
                 aws_secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
                 aws_session_token: Some("IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZVERYLONGSTRINGEXAMPLE".to_string()),
-            }
+            }.into()
         );
 
         assert_eq!(
@@ -497,7 +507,7 @@ aws_session_token = fcZib3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJ
                 aws_access_key_id: Some("AKIAI44QH8DHBEXAMPLE".to_string()),
                 aws_secret_access_key: Some("je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY".to_string()),
                 aws_session_token: Some("fcZib3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZ2luX2IQoJb3JpZVERYLONGSTRINGEXAMPLE".to_string()),
-            }
+            }.into()
         );
 
         Ok(())

@@ -4,8 +4,11 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Write;
 use std::fs;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 
 use anyhow::anyhow;
 use anyhow::Result;
@@ -17,6 +20,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use super::config::Config;
+use super::profile::*;
 use crate::aws::constants::*;
 use crate::time::now;
 use crate::time::parse_rfc3339;
@@ -426,6 +430,85 @@ impl CredentialLoad for EnvLoader {
         };
 
         Ok(Some(cred))
+    }
+}
+
+/// Load credential from environment variables.
+struct CredentialProfileLoader {
+    path: String,
+    profile_name: String,
+
+    /// The timestampe for last updated time of profiles.
+    last_updated: AtomicI64,
+    profiles: Arc<Mutex<CredentialProfiles>>,
+}
+
+impl Debug for CredentialProfileLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialProfileLoader")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CredentialProfileLoader {
+    fn default() -> Self {
+        Self {
+            path: "~/.aws/credentials".to_string(),
+            profile_name: "default".to_string(),
+            last_updated: AtomicI64::default(),
+            profiles: Arc::default(),
+        }
+    }
+}
+
+impl CredentialProfileLoader {
+    /// Get credential profile via this loader.
+    pub async fn get_profile(&self, name: &str) -> Result<Arc<CredentialProfile>> {
+        let meta = tokio::fs::metadata(&self.path)
+            .await
+            .map_err(|err| anyhow!("get metadata of credential file failed: {err}"))?;
+        let last_modified = meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+
+        let profile = if self.last_updated.load(Ordering::Relaxed) >= last_modified as i64 {
+            self.profiles.lock().unwrap().get(name)
+        } else {
+            let ccontent = tokio::fs::read_to_string(&self.path).await?;
+            let profiles = CredentialProfiles::new(&ccontent)?;
+
+            // Update last_updated so that we don't need to read again.
+            self.last_updated
+                .store(now().timestamp(), Ordering::Relaxed);
+            let profile = profiles.get(name);
+
+            *self.profiles.lock().unwrap() = profiles;
+            profile
+        };
+
+        Ok(profile)
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for CredentialProfileLoader {
+    async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
+        let profile = self.get_profile(&self.profile_name).await?;
+
+        if let (Some(access_key_id), Some(secret_access_key)) =
+            (&profile.aws_access_key_id, &profile.aws_secret_access_key)
+        {
+            let cred = Credential {
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+                session_token: profile.aws_session_token.clone(),
+                // Enforce re-read from file after 1 hour.
+                expires_in: Some(now() + chrono::Duration::hours(1)),
+            };
+
+            Ok(Some(cred))
+        } else {
+            Ok(None)
+        }
     }
 }
 
