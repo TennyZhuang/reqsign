@@ -341,6 +341,32 @@ impl Loader {
 
 /// Load credential from environment variables.
 #[derive(Default)]
+struct StaticLoader {
+    cred: Option<Credential>,
+}
+
+impl Debug for StaticLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticLoader").finish_non_exhaustive()
+    }
+}
+
+impl StaticLoader {
+    /// Create a new StaticLoader.
+    pub fn new(cred: Credential) -> Self {
+        Self { cred: Some(cred) }
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for StaticLoader {
+    async fn load_credential(&self, _: Client) -> Result<Option<Credential>> {
+        Ok(self.cred.clone())
+    }
+}
+
+/// Load credential from environment variables.
+#[derive(Default)]
 struct EnvLoader {}
 
 impl Debug for EnvLoader {
@@ -663,6 +689,41 @@ impl CredentialLoad for Ec2InstanceMetadataLoader {
         };
 
         Ok(Some(cred))
+    }
+}
+
+/// Load credential via assume role with web identity.
+struct AssumeRoleLoader {
+    profile_name: String,
+
+    static_loader: StaticLoader,
+    env_loader: EnvLoader,
+    config_profile_loader: ConfigProfileLoader,
+    credential_profile_loader: CredentialProfileLoader,
+}
+
+impl Debug for AssumeRoleLoader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssumeRoleLoader").finish_non_exhaustive()
+    }
+}
+
+impl AssumeRoleLoader {
+    /// AssumeRole needs the API to be signed. We should load source
+    /// credential first and use this credential to sign the request.
+    async fn load_source_credential(&self, client: Client) -> Result<Option<Credential>> {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl CredentialLoad for AssumeRoleLoader {
+    async fn load_credential(&self, client: Client) -> Result<Option<Credential>> {
+        // _resolve_source_credentials
+        //   - some: _resolve_credentials_from_source
+        //   - none: _resolve_credentials_from_profile
+
+        todo!()
     }
 }
 
